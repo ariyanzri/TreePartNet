@@ -1,9 +1,12 @@
+from lib2to3.pytree import LeafPattern
 import os
+from random import random
 import torch
 import numpy as np
 import torch.utils.data as data
 import h5py
 from pointnet2_ops import pointnet2_utils
+import random
 
 class TreeDataset(data.Dataset):
     def __init__(self, h5_filename):
@@ -15,12 +18,32 @@ class TreeDataset(data.Dataset):
         f = h5py.File(self.h5_filename,'r')
         points = f['points'][index]
         #normals = f['normals'][index]
-        isforks = f['isforks'][index]
-        primitives = f['primitive_id'][index]
-        fnodes = f['codebook'][index]
+        
+        is_focal_plant = f['is_focal_plant'][index]
+        initial_clusters = f['initial_clusters'][index]
+        affinity_matrix = f['affinity_matrix'][index]
+        leaf_indices = f['leaf_index'][index]
+        leaf_part_indices = f['leaf_part_index'][index]
+        # fnodes = f['codebook'][index]
         #fns = f['names'][index]
+
+        # all_ind_old = list(set(leaf_indices.tolist()))
+        # all_ind_new = all_ind_old.copy()
+        # random.shuffle(all_ind_new)
+
+        # new_leaf_ind = leaf_indices.copy()
+
+        # for i in range(len(all_ind_old)):
+        #     new_leaf_ind[leaf_indices==all_ind_old[i]] = all_ind_new[i]
+
+        # leaf_indices = new_leaf_ind
+
         f.close()
-        return torch.from_numpy(points).float(),torch.from_numpy(isforks),torch.from_numpy(primitives) ,torch.from_numpy(fnodes)
+        return torch.from_numpy(points).float(),\
+            torch.from_numpy(is_focal_plant).type(torch.LongTensor),\
+            torch.from_numpy(leaf_indices).type(torch.LongTensor),\
+            torch.from_numpy(leaf_part_indices).type(torch.LongTensor),\
+            torch.from_numpy(affinity_matrix)
 
     def __len__(self):
         if self.length != -1:
