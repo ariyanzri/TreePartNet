@@ -17,33 +17,18 @@ class TreeDataset(data.Dataset):
     def __getitem__(self, index):
         f = h5py.File(self.h5_filename,'r')
         points = f['points'][index]
-        #normals = f['normals'][index]
-        
         is_focal_plant = f['is_focal_plant'][index]
-        initial_clusters = f['initial_clusters'][index]
-        affinity_matrix = f['affinity_matrix'][index]
-        leaf_indices = f['leaf_index'][index]
-        leaf_part_indices = f['leaf_part_index'][index]
-        # fnodes = f['codebook'][index]
-        #fns = f['names'][index]
-
-        # all_ind_old = list(set(leaf_indices.tolist()))
-        # all_ind_new = all_ind_old.copy()
-        # random.shuffle(all_ind_new)
-
-        # new_leaf_ind = leaf_indices.copy()
-
-        # for i in range(len(all_ind_old)):
-        #     new_leaf_ind[leaf_indices==all_ind_old[i]] = all_ind_new[i]
-
-        # leaf_indices = new_leaf_ind
-
+        leaf_index = f['leaf_index'][index]
+        leaf_part_index = f['leaf_part_index'][index]
+        leaf_part_full_index = f['leaf_part_full_index'][index]
+        
         f.close()
+        
         return torch.from_numpy(points).float(),\
             torch.from_numpy(is_focal_plant).type(torch.LongTensor),\
-            torch.from_numpy(leaf_indices).type(torch.LongTensor),\
-            torch.from_numpy(leaf_part_indices).type(torch.LongTensor),\
-            torch.from_numpy(affinity_matrix)
+            torch.from_numpy(leaf_index).type(torch.LongTensor),\
+            torch.from_numpy(leaf_part_index).type(torch.LongTensor),\
+            torch.from_numpy(leaf_part_full_index).type(torch.LongTensor)
 
     def __len__(self):
         if self.length != -1:
@@ -53,6 +38,11 @@ class TreeDataset(data.Dataset):
             self.length=len(f['names'])
             f.close()
             return self.length
+
+    def get_name(self,index):
+        f = h5py.File(self.h5_filename,'r')
+        name = f['names'][index].decode("utf-8")
+        return name
 
     def save_ply(self, xyz, cls, fn):
         with open(fn, 'w') as f:
