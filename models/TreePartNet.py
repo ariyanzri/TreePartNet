@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import math
 import pytorch_lightning as pl
 import torch.nn as nn
@@ -15,10 +16,13 @@ sys.path.append(os.path.join(ROOT_DIR, 'utils'))
 sys.path.append(os.path.join(ROOT_DIR, 'pointnet'))
 sys.path.append(os.path.join(ROOT_DIR, 'dgcnn'))
 sys.path.append(ROOT_DIR)
-from TreeDataset import TreeDataset
+from TreeDataset import TreeDataset,SorghumDataset
 from modules import PointNetfeat
 from dgcnn.modules import DGCNN_cls
 from collections import namedtuple
+
+lr_clip = 1e-5
+bnm_clip = 1e-2
 
 def set_bn_momentum_default(bn_momentum):
     def fn(m):
@@ -26,7 +30,6 @@ def set_bn_momentum_default(bn_momentum):
             m.momentum = bn_momentum
 
     return fn
-
 
 class BNMomentumScheduler(lr_sched.LambdaLR):
     def __init__(self, model, bn_lambda, last_epoch=-1, setter=set_bn_momentum_default):
@@ -55,10 +58,6 @@ class BNMomentumScheduler(lr_sched.LambdaLR):
     def load_state_dict(self, state):
         self.last_epoch = state["last_epoch"]
         self.step(self.last_epoch)
-
-
-lr_clip = 1e-5
-bnm_clip = 1e-2
 
 class ScaledDot(nn.Module):
     '''
@@ -188,6 +187,34 @@ class SpaceSimilarityLossV2(nn.Module):
         normalized_distance_gt = torch.where(distances_gt==0,torch.clamp(distance_pred-self.M1,min=0),torch.clamp(self.M2-distance_pred,min=0))
         
         return torch.mean(normalized_distance_gt)
+
+class LeafMetrics(nn.Module):
+
+    def __init__(self,dist):
+        super().__init__()
+        self.threshold = dist
+        
+    def forward(self,input,target):
+        
+        cluster_pred = torch.cdist(input,input)
+
+        target = torch.unsqueeze(target.float(),dim=-1)
+        cluster_gt = torch.cdist(target,target)
+        ones = torch.ones(cluster_pred.shape).cuda()
+        zeros = torch.zeros(cluster_pred.shape).cuda()
+        
+        
+        TP = torch.sum(torch.where((cluster_gt == 0) & (cluster_pred < 5), ones, zeros))
+        TN = torch.sum(torch.where((cluster_gt > 0) & (cluster_pred >= 5), ones, zeros))
+        FP = torch.sum(torch.where((cluster_gt > 0) & (cluster_pred < 5), ones, zeros))
+        FN = torch.sum(torch.where((cluster_gt == 0) & (cluster_pred >= 5), ones, zeros))
+        
+        Acc = (TP+TN)/(TP+FP+TN+FN)
+        Precision = TP/(TP+FP)
+        Recall = TP/(TP+FN) 
+        F = 2*(Precision*Recall)/(Precision+Recall)
+
+        return Acc, Precision, Recall, F
 
 class TreePartNet(pl.LightningModule):
         
@@ -992,6 +1019,260 @@ class SorghumPartNetDGCNN(pl.LightningModule):
             'val_leaf_loss': val_leaf_loss,
             'val_leaf_part_acc': leaf_part_acc, 
             'val_is_focal_plant_acc': is_focal_plant_acc,
+            }
+
+        for k in tensorboard_logs.keys():
+            self.log(k, tensorboard_logs[k], on_epoch=True, prog_bar=True, logger=True)
+
+        return {'val_loss': val_total_loss, 'log': tensorboard_logs}
+
+class SorghumPartNetGroundDGCNN(pl.LightningModule):
+        
+    def __init__(self, hparams):
+        '''
+        Parameters
+        ----------
+        hparams: hyper parameters
+        '''
+        super(SorghumPartNetGroundDGCNN,self).__init__()
+        # self._hparams = hparams
+
+        self.hparams.update(hparams)
+
+        MyStruct = namedtuple('args', 'k')
+        args = MyStruct(k=15)
+
+        self.DGCNN_module = DGCNN_cls(args)
+
+        self.SA_modules = nn.ModuleList()
+        self.SA_modules.append(
+            PointnetSAModuleMSG(
+                npoint=hparams['lc_count'],
+                radii=[0.05, 0.1],
+                nsamples=[16, 32],
+                mlps=[[hparams['input_channels'], 16, 16, 16],
+                      [hparams['input_channels'], 32, 32, 32]],
+                use_xyz=hparams['use_xyz'],
+            )
+        )
+
+        c_out_0 = 16 + 32
+
+        self.SA_modules.append(
+            PointnetSAModuleMSG(
+                npoint=128,
+                radii=[0.2, 0.4],
+                nsamples=[16, 32],
+                mlps=[[c_out_0, 64, 64, 128],
+                      [c_out_0, 64, 64, 128]],
+                use_xyz=hparams['use_xyz'],
+            )
+        )
+
+        c_out_1 = 128 + 128
+
+        self.FP_modules = nn.ModuleList()
+        self.FP_modules.append(PointnetFPModule(mlp=[64, 256, 64]))
+        self.FP_modules.append(PointnetFPModule(mlp=[c_out_0+c_out_1, 256, 64]))
+
+        self.semantic_fc_layer = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Conv1d(128, 3, kernel_size=1),
+        )
+
+        self.save_hyperparameters()
+        self.knn = None
+
+    def forward(self, xyz, input_semantic_label=None):
+        
+        # Normalization (min max)
+        mins,_ = torch.min(xyz,axis=1)
+        maxs,_ = torch.max(xyz,axis=1)
+        xyz = (xyz-mins)/(maxs-mins) - 0.5
+
+        # PointNet SA Module
+        l_xyz, l_features, l_s_idx = [xyz], [None], []
+        for i in range(len(self.SA_modules)):
+            li_xyz, li_features, li_s_idx = self.SA_modules[i](l_xyz[i], l_features[i])
+            l_xyz.append(li_xyz)
+            l_features.append(li_features)
+            l_s_idx.append(li_s_idx)
+
+        # PointNet FP Module
+        for i in range(-1, -(len(self.FP_modules) + 1), -1):
+            l_features[i - 1] = self.FP_modules[i](
+                l_xyz[i - 1], l_xyz[i], l_features[i - 1], l_features[i]
+            )
+
+        # Semantic Label Prediction
+        semantic_label_pred = self.semantic_fc_layer(l_features[0])
+        
+        if input_semantic_label is None:
+            input_semantic_label = torch.clone(semantic_label_pred)
+
+            input_semantic_label = F.softmax(input_semantic_label,dim=1)
+            input_semantic_label = input_semantic_label[0].cpu().detach().numpy().T
+            input_semantic_label = np.argmax(input_semantic_label,1)
+            
+            # input_semantic_label[input_semantic_label == 2] = 0
+            # input_semantic_label[input_semantic_label == 1] = 3
+            # input_semantic_label[input_semantic_label == 0] = 1
+            # input_semantic_label[input_semantic_label == 3] = 0
+            
+            points = xyz[:,input_semantic_label==1,:]
+
+        else:
+            if len(input_semantic_label.shape) == 1:
+                points = xyz[:,input_semantic_label==1,:]
+            else:
+                points = xyz[:,input_semantic_label[0]==1,:]
+        
+        dgcnn_features = self.DGCNN_module(points)
+
+        return semantic_label_pred,dgcnn_features
+
+    def configure_optimizers(self):
+        lr_lbmd = lambda _: max(
+            self.hparams['lr_decay']
+            ** (
+                int(
+                    self.global_step
+                    * self.hparams['batch_size']
+                    / self.hparams['decay_step']
+                )
+            ),
+            lr_clip / self.hparams['lr'],
+        )
+        bn_lbmd = lambda _: max(
+            self.hparams['bn_momentum']
+            * self.hparams['bnm_decay']
+            ** (
+                int(
+                    self.global_step
+                    * self.hparams['batch_size']
+                    / self.hparams['decay_step']
+                )
+            ),
+            bnm_clip,
+        )
+
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=self.hparams['lr'],
+            weight_decay=self.hparams['weight_decay'],
+        )
+
+        lr_scheduler = lr_sched.LambdaLR(optimizer, lr_lambda=lr_lbmd)
+        bnm_scheduler = BNMomentumScheduler(self, bn_lambda=bn_lbmd)
+        bnm_scheduler.optimizer = optimizer
+
+        return [optimizer], [lr_scheduler, bnm_scheduler]
+
+    def _build_dataloader(self,ds_path,shuff=True):
+        dataset = SorghumDataset(ds_path)
+        loader = DataLoader(dataset, batch_size=self.hparams['batch_size'], num_workers=4, shuffle=shuff)
+        return loader
+
+    def train_dataloader(self):
+        return self._build_dataloader(ds_path=self.hparams['train_data'],shuff=True)
+
+    def training_step(self, batch, batch_idx):
+        points,_,semantic_label,_,leaf = batch
+        
+        leaf = leaf[:,semantic_label[0]==1]
+        
+        pred_semantic_label, pred_leaf_features = self(points,semantic_label)
+
+        critirion = torch.nn.CrossEntropyLoss()
+        semantic_label_loss = critirion(pred_semantic_label, semantic_label)
+
+        criterion_cluster = SpaceSimilarityLossV2()
+        leaf_loss = criterion_cluster(pred_leaf_features, leaf)
+
+        total_loss = semantic_label_loss + leaf_loss
+
+        leaf_metrics = LeafMetrics(self.hparams['leaf_space_threshold'])
+        Acc, Prec, Rec, F = leaf_metrics(pred_leaf_features,leaf)
+        
+        with torch.no_grad():
+            semantic_label_acc = (torch.argmax(pred_semantic_label, dim=1) == semantic_label).float().mean()
+        
+        # print(Acc,Prec,Rec,F)
+        
+        tensorboard_logs = {
+            'train_total_loss': total_loss, 
+            'train_semantic_label_loss': semantic_label_loss, 
+            'train_leaf_loss': leaf_loss,
+            'train_semantic_label_acc': semantic_label_acc,
+            'train_leaf_accuracy': Acc,
+            'train_leaf_precision': Prec,
+            'train_leaf_recall': Rec,
+            'train_leaf_f1': F
+            }
+
+        for k in tensorboard_logs.keys():
+            self.log(k, tensorboard_logs[k], on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        return {'loss': total_loss, 'log': tensorboard_logs}
+
+
+    def val_dataloader(self):
+        return self._build_dataloader(ds_path=self.hparams['val_data'],shuff=False)
+
+    def validation_step(self, batch, batch_idx):
+        points,_,semantic_label,_,leaf = batch
+        leaf = leaf[:,semantic_label[0]==1]
+
+        pred_semantic_label, pred_leaf_features = self(points,semantic_label)
+
+        critirion = torch.nn.CrossEntropyLoss()
+        semantic_label_loss = critirion(pred_semantic_label, semantic_label)
+
+        criterion_cluster = SpaceSimilarityLossV2()
+        leaf_loss = criterion_cluster(pred_leaf_features, leaf)
+
+        total_loss = semantic_label_loss + leaf_loss
+
+        leaf_metrics = LeafMetrics(self.hparams['leaf_space_threshold'])
+        Acc, Prec, Rec, F = leaf_metrics(pred_leaf_features,leaf)
+
+        semantic_label_acc = (torch.argmax(pred_semantic_label, dim=1) == semantic_label).float().mean()
+        
+        tensorboard_logs = {
+            'val_total_loss': total_loss, 
+            'val_semantic_label_loss': semantic_label_loss,
+            'val_leaf_loss': leaf_loss,
+            'val_semantic_label_acc': semantic_label_acc,
+            'val_leaf_accuracy': Acc,
+            'val_leaf_precision': Prec,
+            'val_leaf_recall': Rec,
+            'val_leaf_f1': F
+            }
+
+        return tensorboard_logs
+
+    def validation_epoch_end(self, outputs):
+        val_total_loss = torch.stack([x['val_total_loss'] for x in outputs]).mean()
+        semantic_label_loss = torch.stack([x['val_semantic_label_loss'] for x in outputs]).mean()
+        val_leaf_loss = torch.stack([x['val_leaf_loss'] for x in outputs]).mean()
+        semantic_label_acc = torch.stack([x['val_semantic_label_acc'] for x in outputs]).mean()
+        Acc = torch.stack([x['val_leaf_accuracy'] for x in outputs]).mean()
+        Prec = torch.stack([x['val_leaf_precision'] for x in outputs]).mean()
+        Rec = torch.stack([x['val_leaf_recall'] for x in outputs]).mean()
+        F = torch.stack([x['val_leaf_f1'] for x in outputs]).mean()
+
+        tensorboard_logs = {
+            'val_total_loss': val_total_loss, 
+            'val_semantic_label_loss': semantic_label_loss,
+            'val_leaf_loss': val_leaf_loss,
+            'val_semantic_label_acc': semantic_label_acc,
+            'val_leaf_accuracy': Acc,
+            'val_leaf_precision': Prec,
+            'val_leaf_recall': Rec,
+            'val_leaf_f1': F
             }
 
         for k in tensorboard_logs.keys():

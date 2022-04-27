@@ -58,12 +58,52 @@ class TreeDataset(data.Dataset):
             for i in range(pn):
                 f.write('%f %f %f %d\n' % (xyz[i][0], xyz[i][1], xyz[i][2], cls[i]))
 
-class FoliageDataset(data.Dataset):
+class SorghumDataset(data.Dataset):
+    ''''
+    Semantic label guide:
+        * 0 --> ground
+        * 1 --> focal plant
+        * 2 --> surrounding plants
 
+    Ground label guide:
+        * 0 --> not ground
+        * 1 --> ground
+
+    '''
     def __init__(self, h5_filename):
         super().__init__()
         self.h5_filename=h5_filename
         self.length = -1
+
+    def __getitem__(self, index):
+        f = h5py.File(self.h5_filename,'r')
+        points = f['points'][index]
+        is_focal_plant = f['is_focal_plant'][index]
+        ground_index = f['ground_index'][index]
+        plant_index = f['plant_index'][index]
+        leaf_index = f['leaf_index'][index]
+        
+        # Converting arbitrary and non-contigiouse plant IDs to contigiouse list of indices
+        plant_ind = list(set(list(plant_index)))
+        ind = list(range(0,len(plant_ind)))
+        mapping = dict(zip(ind,plant_ind))
+        new_plant = np.zeros(plant_index.shape)
+        for key in mapping:
+            new_plant[plant_index==mapping[key]] = key
+        plant_index = new_plant
+
+        # creating semantic labeling using the guide above
+        semantic_label = is_focal_plant.copy()
+        semantic_label[np.where((is_focal_plant==0) & (ground_index==1))] = 0
+        semantic_label[np.where((is_focal_plant==0) & (ground_index==0))] = 2
+
+        f.close()
+
+        return torch.from_numpy(points).float(),torch.from_numpy(ground_index).float(),\
+            torch.from_numpy(semantic_label).type(torch.LongTensor),\
+            torch.from_numpy(plant_index).type(torch.LongTensor),\
+            torch.from_numpy(leaf_index).type(torch.LongTensor),\
+            
 
     def __len__(self):
         if self.length != -1:
@@ -74,12 +114,11 @@ class FoliageDataset(data.Dataset):
             f.close()
             return self.length
 
-    def __getitem__(self,item):
-        f = h5py.File(self.h5_filename, 'r')
-        points = f['points'][item]
-        isfoliage = f['isfoliage'][item]
-        f.close()
-        return torch.from_numpy(points).float(), torch.from_numpy(isfoliage)
+    def get_name(self,index):
+        f = h5py.File(self.h5_filename,'r')
+        name = f['names'][index].decode("utf-8")
+        return name
+
 
 if __name__ == "__main__":
     ds = TreeDataset('/app/ImplicitCylinders/utils/tree_test.hdf5')
